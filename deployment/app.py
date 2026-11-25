@@ -233,7 +233,7 @@ with st.sidebar:
         "Sensitivity Threshold (Fraud Cutoff):",
         min_value=0.10,
         max_value=0.90,
-        value=0.50,
+        value=0.40,
         step=0.05,
         help="Postings with Fraud Probability exceeding this threshold are flagged as High Risk."
     )
@@ -424,6 +424,9 @@ if analyze_clicked:
         )
 
         with st.spinner("Analyzing linguistic patterns and structural risk indicators..."):
+            device = next(model.parameters()).device
+
+            # 1. Global Document Representation Pass
             inputs = tokenizer(
                 payload_text,
                 padding=True,
@@ -431,15 +434,42 @@ if analyze_clicked:
                 max_length=384,
                 return_tensors="pt"
             )
-            device = next(model.parameters()).device
             inputs = {k: v.to(device) for k, v in inputs.items()}
 
             with torch.no_grad():
                 outputs = model(**inputs)
                 probs = F.softmax(outputs.logits, dim=-1).squeeze(0).cpu().numpy()
 
-            genuine_score = float(probs[0])
-            fraud_score = float(probs[1])
+            global_genuine = float(probs[0])
+            global_fraud = float(probs[1])
+
+            # 2. Deep Multi-Instance Clause Scanner (Prevents scam signal dilution in long text)
+            # Scans individual sentences/paragraphs for localized fraud signals
+            scan_corpus = f"{job_description} {requirements} {benefits}"
+            raw_clauses = re.split(r'(?<=[.!?])\s+|\n+', scan_corpus)
+            meaningful_clauses = [c.strip() for c in raw_clauses if len(c.strip()) >= 20][:15]
+
+            ai_flagged_clauses = []
+            max_clause_fraud = 0.0
+
+            if meaningful_clauses:
+                clause_batch = [f"Job Title: {job_title.strip() if job_title else 'Job Posting'}. {c}" for c in meaningful_clauses]
+                b_enc = tokenizer(clause_batch, padding=True, truncation=True, max_length=128, return_tensors="pt")
+                b_enc = {k: v.to(device) for k, v in b_enc.items()}
+                with torch.no_grad():
+                    b_outs = model(**b_enc)
+                    b_probs = F.softmax(b_outs.logits, dim=-1).cpu().numpy()
+
+                for i, c in enumerate(meaningful_clauses):
+                    c_prob = float(b_probs[i][1])
+                    if c_prob >= risk_threshold:
+                        ai_flagged_clauses.append((c, c_prob))
+                    if c_prob > max_clause_fraud:
+                        max_clause_fraud = c_prob
+
+            # Composite Fraud Risk: A single high-confidence fraudulent clause renders the job high risk
+            fraud_score = max(global_fraud, max_clause_fraud)
+            genuine_score = 1.0 - fraud_score
             is_fraudulent = fraud_score >= risk_threshold
 
         # ==============================================================================
@@ -549,9 +579,15 @@ if analyze_clicked:
             red_flags_found.append("Promises disproportionately high daily earnings ($500+ daily) for entry-level tasks.")
 
         if red_flags_found:
-            st.markdown("#### 🚩 Automated Heuristic Flags Identified:")
+            st.markdown("#### 🚩 Security Rule Violations Identified:")
             for flag in red_flags_found:
                 st.markdown(f"- ⚠️ **Flag:** {flag}")
+
+        if ai_flagged_clauses:
+            st.markdown("#### 🧠 AI Model High-Risk Clause Detections:")
+            st.caption("The deep transformer attention engine detected deceptive/fraudulent intent in the following specific clauses:")
+            for clause, c_prob in sorted(ai_flagged_clauses, key=lambda x: x[1], reverse=True)[:5]:
+                st.markdown(f"- 🔴 **[{c_prob * 100:.1f}% Scam Confidence]:** *\"{clause}\"*")
 
         # Inspection Accordion
         with st.expander("🔍 View Preprocessed Model Input"):
